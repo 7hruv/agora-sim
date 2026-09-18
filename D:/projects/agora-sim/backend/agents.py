@@ -59,20 +59,26 @@ def decide_action(agent, other_agent, pending_offer=None):
     """
     import random
     
+    # Fixed prices
+    FAIR_PRICES = {"fish": 5, "bread": 4}
+    MAX_PRICE = {"fish": 6, "bread": 5}  # Maximum allowed offer (fair + 1)
+    
     # If there's a pending offer from the other agent, respond to it
     if pending_offer:
         offerer, item, price = pending_offer
         
-        # Simple rule: accept if price is fair or better
-        fair_prices = {"fish": 5, "bread": 4}
+        # Enforce maximum price - reject offers that are too high
+        if price > MAX_PRICE.get(item, 999):
+            return ("REFUSE", {"offerer": offerer, "item": item, "price": price})
         
+        # Simple rule: accept if price is fair or better
         if item == "fish":
-            if price <= 5:
+            if price <= FAIR_PRICES["fish"]:
                 return ("ACCEPT", {"offerer": offerer, "item": item, "price": price})
             else:
                 return ("REFUSE", {"offerer": offerer, "item": item, "price": price})
         elif item == "bread":
-            if price <= 4:
+            if price <= FAIR_PRICES["bread"]:
                 return ("ACCEPT", {"offerer": offerer, "item": item, "price": price})
             else:
                 return ("REFUSE", {"offerer": offerer, "item": item, "price": price})
@@ -85,16 +91,36 @@ def decide_action(agent, other_agent, pending_offer=None):
         # Decide what to buy based on inventory
         if agent["inventory"] == "3 fish":
             # Mira has fish, wants bread
-            return ("OFFER_TRADE", {"item": "bread", "price": 4, "buyer": agent["name"], "seller": other_agent["name"]})
+            # Greedy logic: offer fair_price - 1 or -2 (never more than fair)
+            base_price = FAIR_PRICES["bread"]  # 4
+            discount = random.choice([1, 2])  # Greedy: pay less
+            offered_price = max(1, base_price - discount)  # Never go below 1
+            return ("OFFER_TRADE", {"item": "bread", "price": offered_price, "buyer": agent["name"], "seller": other_agent["name"]})
         elif agent["inventory"] == "3 bread":
             # Leo has bread, wants fish
-            return ("OFFER_TRADE", {"item": "fish", "price": 5, "buyer": agent["name"], "seller": other_agent["name"]})
+            # Leo is cautious/honest - offers fair price
+            offered_price = FAIR_PRICES["fish"]  # 5
+            return ("OFFER_TRADE", {"item": "fish", "price": offered_price, "buyer": agent["name"], "seller": other_agent["name"]})
         else:
             # Mixed inventory - still interested in what other has
             if other_agent["inventory"].find("fish") >= 0:
-                return ("OFFER_TRADE", {"item": "fish", "price": 5, "buyer": agent["name"], "seller": other_agent["name"]})
+                # Check if this agent is Mira (greedy) or Leo (honest)
+                if "greedy" in agent["traits"]:
+                    base_price = FAIR_PRICES["fish"]  # 5
+                    discount = random.choice([1, 2])
+                    offered_price = max(1, base_price - discount)
+                else:
+                    offered_price = FAIR_PRICES["fish"]  # Fair price
+                return ("OFFER_TRADE", {"item": "fish", "price": offered_price, "buyer": agent["name"], "seller": other_agent["name"]})
             elif other_agent["inventory"].find("bread") >= 0:
-                return ("OFFER_TRADE", {"item": "bread", "price": 4, "buyer": agent["name"], "seller": other_agent["name"]})
+                # Check if this agent is Mira (greedy) or Leo (honest)
+                if "greedy" in agent["traits"]:
+                    base_price = FAIR_PRICES["bread"]  # 4
+                    discount = random.choice([1, 2])
+                    offered_price = max(1, base_price - discount)
+                else:
+                    offered_price = FAIR_PRICES["bread"]  # Fair price
+                return ("OFFER_TRADE", {"item": "bread", "price": offered_price, "buyer": agent["name"], "seller": other_agent["name"]})
     
     # 30% chance to chat
     elif roll < 0.7:
@@ -108,17 +134,28 @@ def resolve_trade(action_details, buyer_name, seller_name):
     """
     Resolve a trade between buyer and seller.
     Returns: (success: bool, message: str, buyer_delta_money, seller_delta_money, item_transferred)
+    
+    Enforces fixed prices: fish=5, bread=4. Rejects offers >6 for bread or >7 for fish.
     """
     item = action_details["item"]
     price = action_details["price"]
     
-    prices = {"fish": 5, "bread": 4}
+    FAIR_PRICES = {"fish": 5, "bread": 4}
+    MAX_ACCEPTABLE = {"fish": 6, "bread": 5}  # Maximum allowed (fair + 1)
     
-    # Check if price matches fixed price
-    if price == prices.get(item):
+    # Enforce maximum price limit - reject if too high
+    if price > MAX_ACCEPTABLE.get(item, 999):
+        return (False, f"Price too high: {price} exceeds max {MAX_ACCEPTABLE.get(item)}", 0, 0, None)
+    
+    # Check if price matches fixed price or haggled (-1)
+    fair_price = FAIR_PRICES.get(item)
+    if fair_price is None:
+        return (False, "Unknown item", 0, 0, None)
+    
+    if price == fair_price:
         # Trade succeeds at fixed price
         return (True, f"Trade: {price} coins for {item}", -price, price, item)
-    elif price == prices.get(item) - 1:
+    elif price == fair_price - 1:
         # Haggle succeeded
         return (True, f"Trade (haggled): {price} coins for {item}", -price, price, item)
     else:
