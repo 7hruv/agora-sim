@@ -1,23 +1,25 @@
 import httpx
 from prompts import build_prompt
-from db import get_recent_events, update_agent
+from db import get_recent_events
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL = "llama3.2:3b"
+FAIR_PRICES = {"fish": 5, "bread": 4}
+MAX_PRICE = 6
+
 
 def call_llm(prompt):
-    """Call Ollama LLM with timeout and fallback."""
     try:
         response = httpx.post(
             OLLAMA_URL,
             json={
                 "model": MODEL,
                 "prompt": prompt,
-                "temperature": 0.9,
+                "temperature": 0.95,
                 "max_tokens": 80,
                 "stream": False
             },
-            timeout=15.0
+            timeout=20.0
         )
         response.raise_for_status()
         data = response.json()
@@ -27,9 +29,9 @@ def call_llm(prompt):
         print(f"LLM call failed: {e}")
         return "..."
 
+
 def generate_dialogue(agent_name, traits, mood, money, inventory, action_description, target):
-    """Generate dialogue for an agent using LLM."""
-    recent_events = get_recent_events(agent_name, limit=3)
+    recent_events = get_recent_events(agent_name, limit=5)
     prompt = build_prompt(
         name=agent_name,
         traits=traits,
@@ -40,86 +42,96 @@ def generate_dialogue(agent_name, traits, mood, money, inventory, action_descrip
         action_description=action_description,
         target=target
     )
-    dialogue = call_llm(prompt)
-    return dialogue
+    return call_llm(prompt)
+
 
 def shift_mood(current_mood, delta):
-    """Shift mood by delta (-2 to +2)."""
     mood_order = ["sad", "annoyed", "neutral", "happy"]
     idx = mood_order.index(current_mood) if current_mood in mood_order else 2
     new_idx = max(0, min(len(mood_order) - 1, idx + delta))
     return mood_order[new_idx]
 
+
 def decide_action(agent, other_agent, pending_offer=None):
-    """
-    RULES-based decision for what action to take.
-    Returns: (action_type, details)
-    
-    Actions: OFFER_TRADE, ACCEPT, REFUSE, IGNORE, CHAT
-    """
+    """Returns (action_type, details_dict)."""
     import random
-    
-    # If there's a pending offer from the other agent, respond to it
+
+    traits_lower = (agent.get("traits") or "").lower()
+    is_greedy = "greedy" in traits_lower
+    other_inv = other_agent.get("inventory", "") or ""
+
+    # ---------- RESPOND TO PENDING OFFER ----------
     if pending_offer:
-        offerer, item, price = pending_offer
-        
-        # Simple rule: accept if price is fair or better
-        fair_prices = {"fish": 5, "bread": 4}
-        
-        if item == "fish":
-            if price <= 5:
+        offerer, item, price, side = pending_offer
+        fair = FAIR_PRICES.get(item, 999)
+        if price > MAX_PRICE:
+            return ("REFUSE", {"offerer": offerer, "item": item, "price": price})
+
+        if side == "buy":
+            # Other agent wants to BUY from me. I'm the seller.
+            # Greedy seller wants full price; friendly seller accepts fair-1.
+            threshold = fair if is_greedy else fair - 1
+            if price >= threshold:
                 return ("ACCEPT", {"offerer": offerer, "item": item, "price": price})
-            else:
-                return ("REFUSE", {"offerer": offerer, "item": item, "price": price})
-        elif item == "bread":
-            if price <= 4:
-                return ("ACCEPT", {"offerer": offerer, "item": item, "price": price})
-            else:
-                return ("REFUSE", {"offerer": offerer, "item": item, "price": price})
-    
-    # No pending offer - decide own action
-    roll = random.random()
-    
-    # 40% chance to offer trade
-    if roll < 0.4:
-        # Decide what to buy based on inventory
-        if agent["inventory"] == "3 fish":
-            # Mira has fish, wants bread
-            return ("OFFER_TRADE", {"item": "bread", "price": 4, "buyer": agent["name"], "seller": other_agent["name"]})
-        elif agent["inventory"] == "3 bread":
-            # Leo has bread, wants fish
-            return ("OFFER_TRADE", {"item": "fish", "price": 5, "buyer": agent["name"], "seller": other_agent["name"]})
+            return ("REFUSE", {"offerer": offerer, "item": item, "price": price})
         else:
-            # Mixed inventory - still interested in what other has
-            if other_agent["inventory"].find("fish") >= 0:
-                return ("OFFER_TRADE", {"item": "fish", "price": 5, "buyer": agent["name"], "seller": other_agent["name"]})
-            elif other_agent["inventory"].find("bread") >= 0:
-                return ("OFFER_TRADE", {"item": "bread", "price": 4, "buyer": agent["name"], "seller": other_agent["name"]})
-    
-    # 30% chance to chat
-    elif roll < 0.7:
+            # Other agent wants to SELL to me. I'm the buyer.
+            # Greedy buyer wants discount; friendly buyer pays fair.
+            threshold = fair - 1 if is_greedy else fair
+            if price <= threshold:
+                return ("ACCEPT", {"offerer": offerer, "item": item, "price": price})
+            return ("REFUSE", {"offerer": offerer, "item": item, "price": price})
+
+    # ---------- INITIATE ----------
+    roll = random.random()
+
+    # 55% - offer to buy something the other has
+    if roll < 0.55:
+        item = None
+        if "fish" in other_inv and _count(other_inv, "fish") > 0:
+            item = "fish"
+        elif "bread" in other_inv and _count(other_inv, "bread") > 0:
+            item = "bread"
+
+        if item:
+            fair = FAIR_PRICES[item]
+            # Greedy lowballs by exactly 1. Non-greedy pays fair.
+            price = max(1, fair - 1) if is_greedy else fair
+            if price > MAX_PRICE:
+                return ("CHAT", {})
+            return ("OFFER_TRADE", {
+                "item": item,
+                "price": price,
+                "buyer": agent["name"],
+                "seller": other_agent["name"]
+            })
         return ("CHAT", {})
-    
-    # 30% chance to ignore (do nothing meaningful)
-    else:
-        return ("IGNORE", {})
+
+    # 40% - chat
+    if roll < 0.95:
+        return ("CHAT", {})
+
+    # 5% - ignore
+    return ("IGNORE", {})
+
+
+def _count(inv_str, item):
+    for part in inv_str.split(","):
+        tokens = part.strip().split()
+        if len(tokens) >= 2 and tokens[1].lower() == item:
+            try:
+                return int(tokens[0])
+            except ValueError:
+                return 0
+    return 0
+
 
 def resolve_trade(action_details, buyer_name, seller_name):
-    """
-    Resolve a trade between buyer and seller.
-    Returns: (success: bool, message: str, buyer_delta_money, seller_delta_money, item_transferred)
-    """
-    item = action_details["item"]
-    price = action_details["price"]
-    
-    prices = {"fish": 5, "bread": 4}
-    
-    # Check if price matches fixed price
-    if price == prices.get(item):
-        # Trade succeeds at fixed price
+    item = action_details.get("item")
+    price = action_details.get("price")
+    fair = FAIR_PRICES.get(item)
+    if fair is None:
+        return (False, "Unknown item", 0, 0, None)
+    if price <= fair:
         return (True, f"Trade: {price} coins for {item}", -price, price, item)
-    elif price == prices.get(item) - 1:
-        # Haggle succeeded
-        return (True, f"Trade (haggled): {price} coins for {item}", -price, price, item)
-    else:
-        return (False, "Price mismatch", 0, 0, None)
+    return (False, "Price mismatch", 0, 0, None)
