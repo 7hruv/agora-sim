@@ -1,185 +1,319 @@
-from db import get_agents, update_agent, add_event, get_current_round
-from agents import decide_action, generate_dialogue, shift_mood, resolve_trade
+#   ===== START backend/engine.py =====
 
-def run_round():
+"""
+Trade engine for Agora - handles round logic, trade resolution, and mood updates.
+"""
+
+# Fixed prices
+FISH_PRICE = 5
+BREAD_PRICE = 4
+MAX_OFFER_PRICE = 6  # Price cap enforcement
+
+
+def get_item_price(item: str) -> int:
+    """Get the base price of an item."""
+    if item == "fish":
+        return FISH_PRICE
+    elif item == "bread":
+        return BREAD_PRICE
+    return 0
+
+
+def enforce_price_cap(action: str, item: str, price: int) -> tuple:
     """
-    Run one complete round: Mira acts, then Leo acts.
-    Returns list of 2 events created.
+    Fix #5: If any agent tries to offer more than 6 coins for bread or fish,
+    convert the action to REFUSE.
+    
+    Returns: (adjusted_action, adjusted_price)
     """
-    agents = get_agents()
-    mira = next((a for a in agents if a["name"] == "Mira"), None)
-    leo = next((a for a in agents if a["name"] == "Leo"), None)
+    if action == "OFFER_TRADE" and item in ["fish", "bread"]:
+        if price > MAX_OFFER_PRICE:
+            return "REFUSE", price
+    return action, price
+
+
+def calculate_greedy_offer(item: str) -> int:
+    """
+    Fix #4: When Mira (greedy) initiates OFFER_TRADE, her offered price
+    must be item value minus 1 or 2 coins (never more than item value).
+    """
+    base_price = get_item_price(item)
+    # Greedy: offer 1-2 coins less than value
+    import random
+    discount = random.choice([1, 2])
+    return max(1, base_price - discount)
+
+
+def decide_action(actor_name: str, actor_data: dict, target_data: dict, 
+                  pending_offers: list, round_num: int) -> dict:
+    """
+    Rule-based action decision (not LLM).
+    Returns dict with action, item, price, target.
+    """
+    traits = actor_data.get("traits", "")
+    inventory = actor_data.get("inventory", {})
+    money = actor_data.get("money", 0)
+    mood = actor_data.get("mood", "neutral")
     
-    if not mira or not leo:
-        return []
+    other_name = target_data.get("name", "other")
+    other_inventory = target_data.get("inventory", {})
+    other_money = target_data.get("money", 0)
     
-    current_round = get_current_round() + 1
-    events_created = []
+    # Check for pending offers from other agent
+    pending_from_other = [o for o in pending_offers if o.get("from") == other_name]
     
-    # Track pending offers within this round
-    pending_offer = None  # (offerer_name, item, price)
+    # Default action
+    action = "CHAT"
+    item = None
+    price = None
+    target = other_name
     
-    # === MIRA'S TURN ===
-    action_type, action_details = decide_action(mira, leo, pending_offer=None)
-    
-    if action_type == "OFFER_TRADE":
-        pending_offer = (mira["name"], action_details["item"], action_details["price"])
-        action_desc = f"offering to buy {action_details['item']} for {action_details['price']} coins"
-        target = leo["name"]
-    elif action_type == "CHAT":
-        action_desc = "starting a friendly conversation"
-        target = leo["name"]
-    elif action_type == "IGNORE":
-        action_desc = "ignoring the other agent"
-        target = leo["name"]
-    else:
-        action_desc = "taking an action"
-        target = leo["name"]
-    
-    dialogue = generate_dialogue(
-        agent_name=mira["name"],
-        traits=mira["traits"],
-        mood=mira["mood"],
-        money=mira["money"],
-        inventory=mira["inventory"],
-        action_description=action_desc,
-        target=target
-    )
-    
-    # Determine mood change and apply effects
-    new_mood = mira["mood"]
-    new_money = mira["money"]
-    new_inventory = mira["inventory"]
-    
-    if action_type == "OFFER_TRADE":
-        pass  # Mood will be affected by response
-    elif action_type == "CHAT":
-        new_mood = shift_mood(mira["mood"], 1)  # Friendly chat → happier
-    elif action_type == "IGNORE":
-        pass  # Neutral
-    elif action_type in ("ACCEPT", "REFUSE"):
-        pass  # Will be handled when responding
-    
-    # Save Mira's event
-    add_event(current_round, mira["name"], action_type, target, dialogue, new_mood, new_money)
-    update_agent(mira["name"], mood=new_mood, money=new_money, inventory=new_inventory)
-    
-    events_created.append({
-        "round": current_round,
-        "actor": mira["name"],
-        "action": action_type,
-        "target": target,
-        "dialogue": dialogue,
-        "mood_after": new_mood,
-        "money_after": new_money
-    })
-    
-    # === LEO'S TURN ===
-    # Leo may respond to Mira's offer
-    leo_pending = pending_offer if pending_offer and pending_offer[0] == mira["name"] else None
-    
-    action_type_leo, action_details_leo = decide_action(leo, mira, pending_offer=leo_pending)
-    
-    # If Leo is responding to an offer
-    if leo_pending and action_type_leo in ("ACCEPT", "REFUSE"):
-        offerer, item, price = leo_pending
+    # If there's a pending offer, consider responding
+    if pending_from_other:
+        offer = pending_from_other[0]
+        offer_item = offer.get("item")
+        offer_price = offer.get("price")
+        offer_type = offer.get("type")  # "buy" or "sell"
         
-        if action_type_leo == "ACCEPT":
-            success, msg, buyer_delta, seller_delta, transferred = resolve_trade(action_details_leo, mira["name"], leo["name"])
-            
-            if success:
-                # Update money
-                mira_new_money = mira["money"] + buyer_delta
-                leo_new_money = leo["money"] + seller_delta
-                
-                # Update inventory
-                if transferred == "fish":
-                    # Leo gives fish to Mira
-                    mira_inv_count = int(mira["inventory"].split()[0]) + 1
-                    leo_inv_count = int(leo["inventory"].split()[0]) - 1
-                    mira_new_inv = f"{mira_inv_count} {transferred}"
-                    leo_new_inv = f"{leo_inv_count} {transferred}"
-                elif transferred == "bread":
-                    # Mira gives bread to Leo
-                    mira_inv_count = int(mira["inventory"].split()[0]) - 1
-                    leo_inv_count = int(leo["inventory"].split()[0]) + 1
-                    mira_new_inv = f"{mira_inv_count} {transferred}"
-                    leo_new_inv = f"{leo_inv_count} {transferred}"
-                else:
-                    mira_new_inv = mira["inventory"]
-                    leo_new_inv = leo["inventory"]
-                
-                # Both become happy on successful trade
-                mira_mood_after = shift_mood(new_mood, 1)
-                leo_mood_after = shift_mood(leo["mood"], 1)
-                
-                # Save updates
-                update_agent("Mira", mood=mira_mood_after, money=mira_new_money, inventory=mira_new_inv)
-                update_agent("Leo", mood=leo_mood_after, money=leo_new_money, inventory=leo_new_inv)
-                
-                action_desc_leo = f"accepting trade for {item}"
-                target_leo = mira["name"]
-                
-                # Also update Mira's previous event mood
-                # (We already saved it, but we can note the trade succeeded)
+        # Decide whether to accept, refuse, or haggle
+        if "friendly" in traits.lower() or "honest" in traits.lower():
+            # More likely to accept fair deals
+            if offer_type == "buy" and offer_price >= get_item_price(offer_item):
+                action = "ACCEPT"
+                item = offer_item
+                price = offer_price
+            elif offer_type == "sell" and offer_price <= get_item_price(offer_item):
+                action = "ACCEPT"
+                item = offer_item
+                price = offer_price
             else:
-                leo_mood_after = leo["mood"]
-                action_desc_leo = f"attempting to accept but failed"
-                target_leo = mira["name"]
-        
-        elif action_type_leo == "REFUSE":
-            # Refuser becomes annoyed, offerer becomes sad
-            leo_mood_after = shift_mood(leo["mood"], -1)  # annoyed
-            mira_mood_after = shift_mood(new_mood, -2)  # sad
-            
-            update_agent("Leo", mood=leo_mood_after)
-            update_agent("Mira", mood=mira_mood_after)
-            
-            action_desc_leo = f"refusing trade offer"
-            target_leo = mira["name"]
+                # Unfair offer
+                if "cautious" in traits.lower():
+                    action = "REFUSE"
+                else:
+                    action = "REFUSE"
+                item = offer_item
+                price = offer_price
+        elif "greedy" in traits.lower():
+            # Greedy agents haggle or refuse unfair deals
+            if offer_type == "buy" and offer_price < get_item_price(offer_item):
+                # They're offering too little - refuse or haggle
+                action = "REFUSE"
+                item = offer_item
+                price = offer_price
+            elif offer_type == "sell":
+                # They're selling - greedy wants it cheap
+                if offer_price <= get_item_price(offer_item) - 1:
+                    action = "ACCEPT"
+                    item = offer_item
+                    price = offer_price
+                else:
+                    action = "REFUSE"
+                    item = offer_item
+                    price = offer_price
+        else:
+            # Default: accept if fair, refuse otherwise
+            if offer_price == get_item_price(offer_item):
+                action = "ACCEPT"
+                item = offer_item
+                price = offer_price
+            else:
+                action = "REFUSE"
+                item = offer_item
+                price = offer_price
     
-    elif action_type_leo == "OFFER_TRADE":
-        action_desc_leo = f"offering to buy {action_details_leo['item']} for {action_details_leo['price']} coins"
-        target_leo = mira["name"]
-        leo_mood_after = leo["mood"]
-    elif action_type_leo == "CHAT":
-        action_desc_leo = "responding with friendly chat"
-        target_leo = mira["name"]
-        leo_mood_after = shift_mood(leo["mood"], 1)
-        update_agent("Leo", mood=leo_mood_after)
-    elif action_type_leo == "IGNORE":
-        action_desc_leo = "ignoring the other agent"
-        target_leo = mira["name"]
-        leo_mood_after = leo["mood"]
+    # No pending offer - decide to initiate something
     else:
-        action_desc_leo = "taking an action"
-        target_leo = mira["name"]
-        leo_mood_after = leo["mood"]
+        # Greedy agents initiate trades more often
+        if "greedy" in traits.lower():
+            action = "OFFER_TRADE"
+            # Look for items the other has
+            if other_inventory.get("fish", 0) > 0:
+                item = "fish"
+                # Fix #4: Greedy offers less than value
+                price = calculate_greedy_offer(item)
+            elif other_inventory.get("bread", 0) > 0:
+                item = "bread"
+                price = calculate_greedy_offer(item)
+            else:
+                # No items to buy, maybe sell own items
+                if inventory.get("fish", 0) > 0:
+                    item = "fish"
+                    price = get_item_price(item)  # Ask full price when selling
+                elif inventory.get("bread", 0) > 0:
+                    item = "bread"
+                    price = get_item_price(item)
+                else:
+                    action = "CHAT"
+        
+        elif "friendly" in traits.lower():
+            # Friendly agents chat more
+            import random
+            if random.random() < 0.6:
+                action = "CHAT"
+            else:
+                action = "OFFER_TRADE"
+                if other_inventory.get("fish", 0) > 0:
+                    item = "fish"
+                    price = get_item_price(item)  # Fair price
+                elif inventory.get("bread", 0) > 0:
+                    item = "bread"
+                    price = get_item_price(item)
+        
+        elif "cautious" in traits.lower():
+            # Cautious agents rarely initiate
+            import random
+            if random.random() < 0.3:
+                action = "OFFER_TRADE"
+                if other_inventory.get("fish", 0) > 0:
+                    item = "fish"
+                    price = get_item_price(item) - 1  # Slightly cautious on price
+                elif inventory.get("bread", 0) > 0:
+                    item = "bread"
+                    price = get_item_price(item)
+            else:
+                action = "CHAT"
+        else:
+            # Default behavior
+            import random
+            choice = random.random()
+            if choice < 0.4:
+                action = "CHAT"
+            elif choice < 0.7:
+                action = "OFFER_TRADE"
+                if other_inventory.get("fish", 0) > 0:
+                    item = "fish"
+                    price = get_item_price(item)
+                elif inventory.get("bread", 0) > 0:
+                    item = "bread"
+                    price = get_item_price(item)
     
-    dialogue_leo = generate_dialogue(
-        agent_name=leo["name"],
-        traits=leo["traits"],
-        mood=leo_mood_after if 'leo_mood_after' in dir() else leo["mood"],
-        money=leo["money"],
-        inventory=leo["inventory"],
-        action_description=action_desc_leo,
-        target=target_leo
-    )
+    # Fix #5: Enforce price cap
+    action, price = enforce_price_cap(action, item, price) if item else (action, price)
     
-    # Ensure mood is tracked
-    if 'leo_mood_after' not in dir():
-        leo_mood_after = leo["mood"]
+    return {
+        "action": action,
+        "item": item,
+        "price": price,
+        "target": target
+    }
+
+
+def resolve_trade(action: str, actor: str, target: str, item: str, price: int,
+                  actor_data: dict, target_data: dict) -> dict:
+    """
+    Resolve a trade action and return results.
+    Returns dict with success, new_actor_data, new_target_data, mood changes.
+    """
+    result = {
+        "success": False,
+        "actor_data": actor_data.copy(),
+        "target_data": target_data.copy(),
+        "mood_actor": actor_data.get("mood", "neutral"),
+        "mood_target": target_data.get("mood", "neutral"),
+        "description": ""
+    }
     
-    add_event(current_round, leo["name"], action_type_leo, target_leo, dialogue_leo, leo_mood_after, leo["money"])
+    actor_inv = actor_data.get("inventory", {}).copy()
+    actor_money = actor_data.get("money", 0)
+    target_inv = target_data.get("inventory", {}).copy()
+    target_money = target_data.get("money", 0)
     
-    events_created.append({
-        "round": current_round,
-        "actor": leo["name"],
-        "action": action_type_leo,
-        "target": target_leo,
-        "dialogue": dialogue_leo,
-        "mood_after": leo_mood_after,
-        "money_after": leo["money"]
-    })
+    if action == "ACCEPT":
+        # Find the pending offer and execute trade
+        # For simplicity, assume the target had made an offer to buy/sell
+        
+        # Determine trade direction based on who has the item
+        if actor_inv.get(item, 0) > 0:
+            # Actor sells to target
+            if target_money >= price:
+                actor_inv[item] -= 1
+                actor_money += price
+                target_inv[item] = target_inv.get(item, 0) + 1
+                target_money -= price
+                result["success"] = True
+                result["mood_actor"] = "happy"
+                result["mood_target"] = "happy"
+                result["description"] = f"{actor} sold {item} to {target} for {price} coins"
+            else:
+                result["description"] = f"{target} cannot afford {item}"
+                result["mood_actor"] = "annoyed"
+                result["mood_target"] = "sad"
+                
+        elif target_inv.get(item, 0) > 0:
+            # Target sells to actor
+            if actor_money >= price:
+                target_inv[item] -= 1
+                target_money += price
+                actor_inv[item] = actor_inv.get(item, 0) + 1
+                actor_money -= price
+                result["success"] = True
+                result["mood_actor"] = "happy"
+                result["mood_target"] = "happy"
+                result["description"] = f"{actor} bought {item} from {target} for {price} coins"
+            else:
+                result["description"] = f"{actor} cannot afford {item}"
+                result["mood_actor"] = "sad"
+                result["mood_target"] = "annoyed"
+        else:
+            result["description"] = f"No one has {item} to trade"
+            result["mood_actor"] = "neutral"
+            result["mood_target"] = "neutral"
     
-    return events_created
+    elif action == "REFUSE":
+        result["description"] = f"{actor} refused the offer"
+        result["mood_actor"] = "annoyed"
+        result["mood_target"] = "sad"
+    
+    elif action == "IGNORE":
+        result["description"] = f"{actor} ignored {target}"
+        result["mood_actor"] = "neutral"
+        result["mood_target"] = "neutral"
+    
+    elif action == "CHAT":
+        result["description"] = f"{actor} chatted with {target}"
+        # Friendly chat drifts toward happy
+        if actor_data.get("mood") in ["sad", "annoyed"]:
+            result["mood_actor"] = "neutral"
+        elif actor_data.get("mood") == "neutral":
+            result["mood_actor"] = "happy"
+        else:
+            result["mood_actor"] = "happy"
+            
+        if target_data.get("mood") in ["sad", "annoyed"]:
+            result["mood_target"] = "neutral"
+        elif target_data.get("mood") == "neutral":
+            result["mood_target"] = "happy"
+        else:
+            result["mood_target"] = "happy"
+    
+    elif action == "OFFER_TRADE":
+        result["description"] = f"{actor} offered to trade {item} for {price} coins"
+        result["mood_actor"] = actor_data.get("mood", "neutral")
+        result["mood_target"] = target_data.get("mood", "neutral")
+    
+    result["actor_data"]["inventory"] = actor_inv
+    result["actor_data"]["money"] = actor_money
+    result["target_data"]["inventory"] = target_inv
+    result["target_data"]["money"] = target_money
+    
+    return result
+
+
+def update_mood(current_mood: str, event_mood: str) -> str:
+    """Update mood based on event, with some inertia."""
+    mood_order = ["sad", "annoyed", "neutral", "happy"]
+    
+    current_idx = mood_order.index(current_mood) if current_mood in mood_order else 2
+    event_idx = mood_order.index(event_mood) if event_mood in mood_order else 2
+    
+    # Move halfway toward the event mood
+    diff = event_idx - current_idx
+    if abs(diff) <= 1:
+        return event_mood
+    else:
+        new_idx = current_idx + (1 if diff > 0 else -1)
+        return mood_order[new_idx]
+
+
+#   ===== END backend/engine.py =====
